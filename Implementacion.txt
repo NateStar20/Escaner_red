@@ -1,0 +1,12 @@
+Crear un script en PowerShell (.ps1) que obtenga:
+
+Sistema operativo
+Hostname
+MAC Address
+Fabricante del dispositivo
+Dirección IP
+Fecha y hora de uso de puertos
+Regla: No registrar el mismo puerto si ya fue utilizado en los últimos 10 minutos.
+
+Validación de Direcciones
+Comprobar que la MAC Address y la Dirección IP no estén asignadas a otro hostname en la red.
