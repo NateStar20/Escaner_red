@@ -22,23 +22,111 @@ function Exec-SQL($query) {
 function Detectar-SO {
     param($ip)
 
-    $puertosWin = @(135,139,445,3389)
-    $puertosLinux = @(22,111)
-    $puertosRouter = @(23,53,80,443,1900)
+    # -----------------------------
+    # 1. Windows por SMB (445)
+    # -----------------------------
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        if ($client.ConnectAsync($ip, 445).Wait(200)) {
+            $stream = $client.GetStream()
+            $buffer = New-Object Byte[] 1024
+            $stream.ReadTimeout = 500
 
-    $abiertos = @()
+            # Paquete SMB mínimo
+            $packet = [byte[]](0x00,0x00,0x00,0x54,0xFF,0x53,0x4D,0x42,0x72)
+            $stream.Write($packet,0,$packet.Length)
 
-    foreach ($p in $puertosWin + $puertosLinux + $puertosRouter) {
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        if ($tcp.ConnectAsync($ip, $p).Wait(150)) { $abiertos += $p }
-        $tcp.Dispose()
+            Start-Sleep -Milliseconds 200
+            if ($stream.DataAvailable) {
+                $read = $stream.Read($buffer,0,1024)
+                $data = [System.Text.Encoding]::ASCII.GetString($buffer,0,$read)
+                if ($data -match "Windows") {
+                    return @{SO="Windows"; Metodo="SMB"}
+                }
+            }
+        }
+        $client.Dispose()
+    } catch {}
+
+    # -----------------------------
+    # 2. Linux por SSH Banner (22)
+    # -----------------------------
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        if ($client.ConnectAsync($ip, 22).Wait(200)) {
+            $stream = $client.GetStream()
+            $buffer = New-Object Byte[] 1024
+            Start-Sleep -Milliseconds 200
+
+            if ($stream.DataAvailable) {
+                $read = $stream.Read($buffer,0,1024)
+                $banner = [System.Text.Encoding]::ASCII.GetString($buffer,0,$read)
+
+                if ($banner -match "OpenSSH|Debian|Ubuntu|CentOS|Fedora|RedHat|Linux") {
+                    return @{SO="Linux"; Metodo="SSH Banner"}
+                }
+            }
+        }
+        $client.Dispose()
+    } catch {}
+
+    # -----------------------------
+    # 3. NetBIOS (Windows)
+    # -----------------------------
+    try {
+        $nb = nbtstat -A $ip 2>$null
+        if ($nb -match "WINDOWS") {
+            return @{SO="Windows"; Metodo="NetBIOS"}
+        }
+    } catch {}
+
+    # -----------------------------
+    # 4. SNMP (Switch/Router/Linux)
+    # -----------------------------
+    try {
+        $udp = New-Object System.Net.Sockets.UdpClient
+        $endpoint = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($ip), 161)
+
+        $snmp = [byte[]](0x30,0x26,0x02,0x01,0x00,0x04,0x06,0x70,0x75,0x62,0x6C,0x69,0x63,
+                         0xA0,0x19,0x02,0x04,0x70,0x12,0x34,0x21,0x02,0x01,0x00,
+                         0x02,0x01,0x00,0x30,0x0B,0x30,0x09,0x06,0x05,
+                         0x2B,0x06,0x01,0x02,0x01,0x05,0x00)
+
+        $udp.Send($snmp,$snmp.Length,$endpoint) | Out-Null
+        Start-Sleep -Milliseconds 400
+
+        if ($udp.Available -gt 0) {
+            return @{SO="Router / Linux / Switch"; Metodo="SNMP"}
+        }
+
+        $udp.Close()
+    } catch {}
+
+    # -----------------------------
+    # 5. HTTP/HTTPS Headers (Router)
+    # -----------------------------
+    foreach ($proto in @("http","https")) {
+        try {
+            $r = Invoke-WebRequest "$proto://$ip" -Method Head -TimeoutSec 1 -ErrorAction Stop
+            if ($r.Headers.Server -match "MikroTik|Ubiquiti|Router|TP-Link|Cisco|D-Link") {
+                return @{SO="Router / IoT"; Metodo="HTTP Header"}
+            }
+        } catch {}
     }
 
-    if ($abiertos -contains 445 -or $abiertos -contains 135) { return "Windows" }
-    if ($abiertos -contains 22) { return "Linux" }
-    if ($abiertos -contains 23 -or $abiertos -contains 1900) { return "Router / IoT" }
+    # -----------------------------
+    # 6. TTL fingerprint (respaldo)
+    # -----------------------------
+    try {
+        $ping = Test-Connection -Count 1 -Quiet:$false -ComputerName $ip -ErrorAction Stop
+        $ttl = $ping.IPv4Statistics.Ttl
 
-    return "Desconocido"
+        if ($ttl -ge 120)      { return @{SO="Windows (Probable)"; Metodo="TTL"} }
+        elseif ($ttl -ge 60)  { return @{SO="Linux (Probable)"; Metodo="TTL"} }
+    } catch {}
+
+    # -----------------------------
+    return @{SO="Desconocido"; Metodo="Ninguno"}
 }
 
 # =======================================
@@ -81,75 +169,61 @@ $mac = $mac -replace "-", ":"
 $fechaScan = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
 # =======================================
-# INSERT / UPDATE EQUIPO LOCAL
+# INSERT / UPDATE LOCAL
 # =======================================
 $queryEquipo = @"
-INSERT INTO Gerardo_equipos (sistema_operativo, ip, mac, nombre_host, fecha_escaneo, fabricante_id)
-SELECT '$so', '$ipLocal', '$mac', '$hostname', '$fechaScan', f.id
+INSERT INTO Gerardo_equipos (sistema_operativo, ip, mac, nombre_host, fecha_escaneo, fabricante_id, metodo_detectado)
+SELECT '$so', '$ipLocal', '$mac', '$hostname', '$fechaScan', f.id, 'Local'
 FROM Gerardo_fabricantes_mac f
 WHERE '$mac' LIKE CONCAT(f.oui, '%')
 UNION
-SELECT '$so', '$ipLocal', '$mac', '$hostname', '$fechaScan', NULL
+SELECT '$so', '$ipLocal', '$mac', '$hostname', '$fechaScan', NULL, 'Local'
 LIMIT 1
-
+ON DUPLICATE KEY UPDATE
     sistema_operativo = VALUES(sistema_operativo),
     fecha_escaneo = VALUES(fecha_escaneo),
-    fabricante_id = VALUES(fabricante_id);
+    fabricante_id = VALUES(fabricante_id),
+    metodo_detectado = VALUES(metodo_detectado);
 "@
-
 Exec-SQL $queryEquipo
 
-
-# Obtener ID del equipo local
+# Obtener ID
 $equipoID = (Exec-SQL "SELECT id FROM Gerardo_equipos WHERE mac='$mac' ORDER BY id DESC LIMIT 1;" | Select-Object -Last 1).Trim()
-
-Write-Host "🆔 ID del equipo local: $equipoID"
-
+Write-Host "🆔 ID local: $equipoID"
 Write-Host "======================="
-
-
 # =======================================
-# ESCANEO DE PUERTOS DEL EQUIPO LOCAL
-
+# ESCANEO DE PUERTOS LOCAL
 # =======================================
 $puertos = @(20,21,22,23,25,53,80,110,135,139,143,161,162,389,636,137,138,514,443,445,3306,3389,8080,5900)
 
-
 foreach ($puerto in $puertos) {
-
     $tcp = New-Object System.Net.Sockets.TcpClient
-
     try {
         $resultado = $tcp.ConnectAsync($ipLocal, $puerto).Wait(300)
-
         if ($resultado) {
-
             $fechaPuerto = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             $queryPuerto = @"
 INSERT INTO Gerardo_equipo_protocolo (equipo_id, protocolo_id, puerto, fecha_uso)
-
 SELECT $equipoID, p.id, $puerto, '$fechaPuerto'
-
 FROM Gerardo_protocolos p
 WHERE p.numero = $puerto
 LIMIT 1;
+"@
+            Write-Host "🟢 Puerto $puerto abierto"
+        } else {
             Write-Host "🔘 Puerto $puerto cerrado"
         }
     } catch {
         Write-Host "🔘 Puerto $puerto cerrado"
     } finally { $tcp.Dispose() }
 }
-"@
 
 # =======================================
 # ESCANEO COMPLETO DE LA SUBNET
-            Exec-SQL $queryPuerto
 # =======================================
 for ($i = 1; $i -le 100; $i++) {
     $ipActual = "$segmento.$i"
-    Write-Host "🔎 Probando $ipActual ..." -NoNewline
 
-            Write-Host "🟢 Puerto $puerto abierto"
     if (Test-Connection -Quiet -Count 1 -TimeoutSeconds 1 $ipActual) {
         Write-Host " ✔ Activo"
 
@@ -158,7 +232,6 @@ for ($i = 1; $i -le 100; $i++) {
         $arp = arp -a $ipActual | Select-String $ipActual
         if ($arp) { 
             $macRemota = ($arp.ToString().Split(" ",[System.StringSplitOptions]::RemoveEmptyEntries))[1] 
-        } else {
             $macRemota = $macRemota -replace "-", ":"
         } else { 
             $macRemota = "00:00:00:00:00:00"
@@ -166,27 +239,25 @@ for ($i = 1; $i -le 100; $i++) {
 
         $fecha = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
-        # =======================================
-        # DETECTAR SISTEMA OPERATIVO REMOTO
-        # =======================================
-        $soRemoto = Detectar-SO $ipActual
+        # ======== DETECCION DE SO ========
+        $det = Detectar-SO $ipActual
+        $metodoSO = $det.Metodo
 
-        # =======================================
-        # INSERT / UPDATE TODOS LOS EQUIPOS ACTIVOS
-        # =======================================
+        # ======== INSERT / UPDATE ========
         $query = @"
-INSERT INTO Gerardo_equipos (sistema_operativo, ip, mac, nombre_host, fecha_escaneo, fabricante_id)
-SELECT '$soRemoto', '$ipActual', '$macRemota', '$hostRemoto', '$fecha', f.id
+INSERT INTO Gerardo_equipos (sistema_operativo, ip, mac, nombre_host, fecha_escaneo, fabricante_id, metodo_detectado)
+SELECT '$soRemoto', '$ipActual', '$macRemota', '$hostRemoto', '$fecha', f.id, '$metodoSO'
 FROM Gerardo_fabricantes_mac f
 WHERE '$macRemota' LIKE CONCAT(f.oui, '%')
 UNION
-SELECT '$soRemoto', '$ipActual', '$macRemota', '$hostRemoto', '$fecha', NULL
+SELECT '$soRemoto', '$ipActual', '$macRemota', '$hostRemoto', '$fecha', NULL, '$metodoSO'
 LIMIT 1
 ON DUPLICATE KEY UPDATE
     sistema_operativo = VALUES(sistema_operativo),
     nombre_host = VALUES(nombre_host),
     fecha_escaneo = VALUES(fecha_escaneo),
-    fabricante_id = VALUES(fabricante_id);
+    fabricante_id = VALUES(fabricante_id),
+    metodo_detectado = VALUES(metodo_detectado);
 "@
         Exec-SQL $query
     } else {
@@ -195,4 +266,3 @@ ON DUPLICATE KEY UPDATE
 }
 
 Write-Host "✅ REPORTE COMPLETO GUARDADO EN MySQL (XAMPP)"
-
